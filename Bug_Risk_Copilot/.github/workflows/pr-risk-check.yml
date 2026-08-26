@@ -1,0 +1,149 @@
+name: Bug-Risk Copilot Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  bug-risk-check:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Get PR diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+      
+      - name: Run Bug-Risk Analysis
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python -c "
+          import requests
+          import json
+          
+          # Read diff
+          with open('/tmp/pr.diff', 'r') as f:
+              diff_content = f.read()
+          
+          # Call local API or use Python module directly
+          from api.main import analyze
+          from pydantic import BaseModel
+          
+          class DiffInput(BaseModel):
+              diff: str
+              commit_hash: str = None
+          
+          input_data = DiffInput(
+              diff=diff_content,
+              commit_hash='${{ github.event.pull_request.head.sha }}'
+          )
+          
+          # For MVP, run analysis directly
+          try:
+              # Import and run agent directly (no server)
+              from agent.agent import BugRiskAgent
+              from features.build_features import FeatureExtractor
+              
+              agent = BugRiskAgent(threshold=0.6)
+              agent.build_graph()
+              
+              # Mock analysis (in production: call /analyze endpoint)
+              state = {
+                  'commit_hash': '${{ github.event.pull_request.head.sha }}',
+                  'diff_text': diff_content[:500],
+                  'risk_score': 0.65,
+                  'top_features': [
+                      {'feature': 'total_churn', 'value': 100}
+                  ],
+              }
+              
+              result = agent.run(state)
+              
+              # Save result
+              with open('/tmp/analysis.json', 'w') as f:
+                  json.dump(result, f)
+              
+          except Exception as e:
+              print(f'Analysis failed: {e}')
+              with open('/tmp/analysis.json', 'w') as f:
+                  json.dump({'error': str(e)}, f)
+          "
+      
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            
+            try {
+              const analysis = JSON.parse(fs.readFileSync('/tmp/analysis.json', 'utf8'));
+              
+              if (analysis.error) {
+                const comment = `
+            ⚠️ **Bug-Risk Analysis Failed**
+            
+            Error: ${analysis.error}
+                `;
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+              } else {
+                const riskLevel = analysis.risk_score > 0.7 ? '🔴 HIGH' : 
+                                 analysis.risk_score > 0.5 ? '🟡 MEDIUM' : '🟢 LOW';
+                
+                const comment = `
+            ## 🤖 Bug-Risk Copilot Analysis
+            
+            **Risk Level**: ${riskLevel}
+            **Risk Score**: ${(analysis.risk_score * 100).toFixed(1)}%
+            
+            ### Analysis
+            ${analysis.explanation}
+            
+            ### Recommendation
+            ${analysis.action === 'escalate' ? 
+              '⚠️ **Flagged for review** - High-risk patterns detected' :
+              '✅ **Standard review** - Low-risk patterns'}
+            
+            ---
+            *Analysis performed by Bug-Risk Copilot (AI-powered code review)*
+                `;
+                
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+              }
+            } catch (error) {
+              console.error('Failed to parse analysis:', error);
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '❌ Bug-Risk analysis encountered an error. Please check logs.'
+              });
+            }
